@@ -105,10 +105,11 @@ function getOrCreateState(event: SlackEvent): SessionState {
 
 	let state = sessionStates.get(sessionKey);
 	if (!state) {
-		const channelDir = join(workingDir, event.channel);
+		// Use a thread-specific subdirectory so each session gets its own context.jsonl
+		const channelDir = join(workingDir, event.channel, threadKey);
 		// Thread replies to an existing session should reuse the runner,
 		// but if the session doesn't exist yet, create a fresh one
-		const runner = createFreshRunner(sandbox, event.channel, channelDir);
+		const runner = createFreshRunner(sandbox, event.channel, channelDir, workingDir);
 		state = {
 			running: false,
 			runner,

@@ -102,13 +102,12 @@ function getMemory(channelDir: string): string {
 	return parts.join("\n\n");
 }
 
-function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
+function loadMomSkills(hostWorkspaceDir: string, workspacePath: string): Skill[] {
 	const skillMap = new Map<string, Skill>();
 
-	// channelDir is the host path (e.g., /Users/.../data/C0A34FL8PMH)
-	// hostWorkspacePath is the parent directory on host
+	// hostWorkspaceDir is the host-side workspace root (e.g., /workspace)
 	// workspacePath is the container path (e.g., /workspace)
-	const hostWorkspacePath = join(channelDir, "..");
+	const hostWorkspacePath = hostWorkspaceDir;
 
 	// Helper to translate host paths to container paths
 	const translatePath = (hostPath: string): string => {
@@ -122,14 +121,6 @@ function loadMomSkills(channelDir: string, workspacePath: string): Skill[] {
 	const workspaceSkillsDir = join(hostWorkspacePath, "skills");
 	for (const skill of loadSkillsFromDir({ dir: workspaceSkillsDir, source: "workspace" }).skills) {
 		// Translate paths to container paths for system prompt
-		skill.filePath = translatePath(skill.filePath);
-		skill.baseDir = translatePath(skill.baseDir);
-		skillMap.set(skill.name, skill);
-	}
-
-	// Load channel-specific skills (override workspace skills on collision)
-	const channelSkillsDir = join(channelDir, "skills");
-	for (const skill of loadSkillsFromDir({ dir: channelSkillsDir, source: "channel" }).skills) {
 		skill.filePath = translatePath(skill.filePath);
 		skill.baseDir = translatePath(skill.baseDir);
 		skillMap.set(skill.name, skill);
@@ -395,11 +386,16 @@ const channelRunners = new Map<string, AgentRunner>();
  * Get or create an AgentRunner for a channel.
  * Runners are cached - one per channel, persistent across messages.
  */
-export function getOrCreateRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
+export function getOrCreateRunner(
+	sandboxConfig: SandboxConfig,
+	channelId: string,
+	channelDir: string,
+	hostWorkspaceDir: string,
+): AgentRunner {
 	const existing = channelRunners.get(channelId);
 	if (existing) return existing;
 
-	const runner = createRunner(sandboxConfig, channelId, channelDir);
+	const runner = createRunner(sandboxConfig, channelId, channelDir, hostWorkspaceDir);
 	channelRunners.set(channelId, runner);
 	return runner;
 }
@@ -408,8 +404,13 @@ export function getOrCreateRunner(sandboxConfig: SandboxConfig, channelId: strin
  * Create a fresh AgentRunner for a new thread session.
  * Does not load existing context - starts clean.
  */
-export function createFreshRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
-	return createRunner(sandboxConfig, channelId, channelDir, false);
+export function createFreshRunner(
+	sandboxConfig: SandboxConfig,
+	channelId: string,
+	channelDir: string,
+	hostWorkspaceDir: string,
+): AgentRunner {
+	return createRunner(sandboxConfig, channelId, channelDir, hostWorkspaceDir, false);
 }
 
 /**
@@ -420,24 +421,25 @@ function createRunner(
 	sandboxConfig: SandboxConfig,
 	channelId: string,
 	channelDir: string,
+	hostWorkspaceDir: string,
 	loadContext = true,
 ): AgentRunner {
 	const executor = createExecutor(sandboxConfig);
-	const workspacePath = executor.getWorkspacePath(channelDir.replace(`/${channelId}`, ""));
+	const workspacePath = executor.getWorkspacePath(hostWorkspaceDir);
 
 	// Create tools
 	const tools = createMomTools(executor);
 
 	// Initial system prompt (will be updated each run with fresh memory/channels/users/skills)
 	const memory = getMemory(channelDir);
-	const skills = loadMomSkills(channelDir, workspacePath);
+	const skills = loadMomSkills(hostWorkspaceDir, workspacePath);
 	const systemPrompt = buildSystemPrompt(workspacePath, channelId, memory, sandboxConfig, [], [], skills);
 
 	// Create session manager and settings manager
 	// Use a fixed context.jsonl file per channel (not timestamped like coding-agent)
 	const contextFile = join(channelDir, "context.jsonl");
 	const sessionManager = SessionManager.open(contextFile, channelDir);
-	const settingsManager = new MomSettingsManager(join(channelDir, ".."));
+	const settingsManager = new MomSettingsManager(hostWorkspaceDir);
 
 	// Create AuthStorage and ModelRegistry
 	// Auth stored outside workspace so agent can't access it
@@ -607,13 +609,11 @@ function createRunner(
 				for (const thinking of thinkingParts) {
 					log.logThinking(logCtx, thinking);
 					queue.enqueueMessage(`_${thinking}_`, "main", "thinking main");
-					queue.enqueueMessage(`_${thinking}_`, "thread", "thinking thread", false);
 				}
 
 				if (text.trim()) {
 					log.logResponse(logCtx, text);
 					queue.enqueueMessage(text, "main", "response main");
-					queue.enqueueMessage(text, "thread", "response thread", false);
 				}
 			}
 		} else if (event.type === "auto_compaction_start") {
@@ -679,7 +679,7 @@ function createRunner(
 
 			// Update system prompt with fresh memory, channel/user info, and skills
 			const memory = getMemory(channelDir);
-			const skills = loadMomSkills(channelDir, workspacePath);
+			const skills = loadMomSkills(hostWorkspaceDir, workspacePath);
 			const systemPrompt = buildSystemPrompt(
 				workspacePath,
 				channelId,
