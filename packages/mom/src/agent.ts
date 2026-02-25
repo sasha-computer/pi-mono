@@ -405,10 +405,23 @@ export function getOrCreateRunner(sandboxConfig: SandboxConfig, channelId: strin
 }
 
 /**
+ * Create a fresh AgentRunner for a new thread session.
+ * Does not load existing context - starts clean.
+ */
+export function createFreshRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
+	return createRunner(sandboxConfig, channelId, channelDir, false);
+}
+
+/**
  * Create a new AgentRunner for a channel.
  * Sets up the session and subscribes to events once.
  */
-function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDir: string): AgentRunner {
+function createRunner(
+	sandboxConfig: SandboxConfig,
+	channelId: string,
+	channelDir: string,
+	loadContext = true,
+): AgentRunner {
 	const executor = createExecutor(sandboxConfig);
 	const workspacePath = executor.getWorkspacePath(channelDir.replace(`/${channelId}`, ""));
 
@@ -443,11 +456,13 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 		getApiKey: async () => getAnthropicApiKey(authStorage),
 	});
 
-	// Load existing messages
-	const loadedSession = sessionManager.buildSessionContext();
-	if (loadedSession.messages.length > 0) {
-		agent.replaceMessages(loadedSession.messages);
-		log.logInfo(`[${channelId}] Loaded ${loadedSession.messages.length} messages from context.jsonl`);
+	// Load existing messages only if requested (not for fresh thread sessions)
+	if (loadContext) {
+		const loadedSession = sessionManager.buildSessionContext();
+		if (loadedSession.messages.length > 0) {
+			agent.replaceMessages(loadedSession.messages);
+			log.logInfo(`[${channelId}] Loaded ${loadedSession.messages.length} messages from context.jsonl`);
+		}
 	}
 
 	const resourceLoader: ResourceLoader = {
@@ -826,27 +841,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 				}
 			}
 
-			// Log usage summary with context info
-			if (runState.totalUsage.cost.total > 0) {
-				// Get last non-aborted assistant message for context calculation
-				const messages = session.messages;
-				const lastAssistantMessage = messages
-					.slice()
-					.reverse()
-					.find((m) => m.role === "assistant" && (m as any).stopReason !== "aborted") as any;
-
-				const contextTokens = lastAssistantMessage
-					? lastAssistantMessage.usage.input +
-						lastAssistantMessage.usage.output +
-						lastAssistantMessage.usage.cacheRead +
-						lastAssistantMessage.usage.cacheWrite
-					: 0;
-				const contextWindow = model.contextWindow || 200000;
-
-				const summary = log.logUsageSummary(runState.logCtx!, runState.totalUsage, contextTokens, contextWindow);
-				runState.queue.enqueue(() => ctx.respondInThread(summary), "usage summary");
-				await queueChain;
-			}
+			// Usage summary removed - not useful on OAuth subscriptions
 
 			// Clear run state
 			runState.ctx = null;

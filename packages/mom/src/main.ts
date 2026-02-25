@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { join, resolve } from "path";
-import { type AgentRunner, getOrCreateRunner } from "./agent.js";
+import { type AgentRunner, createFreshRunner } from "./agent.js";
 import { downloadChannel } from "./download.js";
 import { createEventsWatcher } from "./events.js";
 import * as log from "./log.js";
@@ -79,30 +79,44 @@ if (!MOM_SLACK_APP_TOKEN || !MOM_SLACK_BOT_TOKEN) {
 await validateSandbox(sandbox);
 
 // ============================================================================
-// State (per channel)
+// State (per thread - each top-level message starts a new session)
 // ============================================================================
 
-interface ChannelState {
+interface SessionState {
 	running: boolean;
 	runner: AgentRunner;
 	store: ChannelStore;
 	stopRequested: boolean;
 	stopMessageTs?: string;
+	channelId: string;
 }
 
-const channelStates = new Map<string, ChannelState>();
+const sessionStates = new Map<string, SessionState>();
 
-function getState(channelId: string): ChannelState {
-	let state = channelStates.get(channelId);
+/**
+ * Get or create state for a session.
+ * For thread replies, the key is the thread_ts (reuses existing session).
+ * For new top-level messages, a fresh runner is created.
+ */
+function getOrCreateState(event: SlackEvent): SessionState {
+	// Thread replies reuse the parent thread's session
+	const threadKey = event.thread_ts || event.ts;
+	const sessionKey = `${event.channel}:${threadKey}`;
+
+	let state = sessionStates.get(sessionKey);
 	if (!state) {
-		const channelDir = join(workingDir, channelId);
+		const channelDir = join(workingDir, event.channel);
+		// Thread replies to an existing session should reuse the runner,
+		// but if the session doesn't exist yet, create a fresh one
+		const runner = createFreshRunner(sandbox, event.channel, channelDir);
 		state = {
 			running: false,
-			runner: getOrCreateRunner(sandbox, channelId, channelDir),
+			runner,
 			store: new ChannelStore({ workingDir, botToken: MOM_SLACK_BOT_TOKEN! }),
 			stopRequested: false,
+			channelId: event.channel,
 		};
-		channelStates.set(channelId, state);
+		sessionStates.set(sessionKey, state);
 	}
 	return state;
 }
@@ -111,7 +125,7 @@ function getState(channelId: string): ChannelState {
 // Create SlackContext adapter
 // ============================================================================
 
-function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelState, isEvent?: boolean) {
+function createSlackContext(event: SlackEvent, slack: SlackBot, state: SessionState, isEvent?: boolean) {
 	let messageTs: string | null = null;
 	const threadMessageTs: string[] = [];
 	let accumulatedText = "";
@@ -147,7 +161,9 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 				if (messageTs) {
 					await slack.updateMessage(event.channel, messageTs, displayText);
 				} else {
-					messageTs = await slack.postMessage(event.channel, displayText);
+					// For thread-based sessions, always reply in the thread
+					const threadTs = event.thread_ts || event.ts;
+					messageTs = await slack.postInThread(event.channel, threadTs, displayText);
 				}
 
 				if (shouldLog && messageTs) {
@@ -164,7 +180,8 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 				if (messageTs) {
 					await slack.updateMessage(event.channel, messageTs, displayText);
 				} else {
-					messageTs = await slack.postMessage(event.channel, displayText);
+					const threadTs = event.thread_ts || event.ts;
+					messageTs = await slack.postInThread(event.channel, threadTs, displayText);
 				}
 			});
 			await updatePromise;
@@ -185,7 +202,8 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 				updatePromise = updatePromise.then(async () => {
 					if (!messageTs) {
 						accumulatedText = eventFilename ? `_Starting event: ${eventFilename}_` : "_Thinking_";
-						messageTs = await slack.postMessage(event.channel, accumulatedText + workingIndicator);
+						const threadTs = event.thread_ts || event.ts;
+						messageTs = await slack.postInThread(event.channel, threadTs, accumulatedText + workingIndicator);
 					}
 				});
 				await updatePromise;
@@ -234,31 +252,35 @@ function createSlackContext(event: SlackEvent, slack: SlackBot, state: ChannelSt
 // ============================================================================
 
 const handler: MomHandler = {
-	isRunning(channelId: string): boolean {
-		const state = channelStates.get(channelId);
-		return state?.running ?? false;
+	isRunning(sessionKey: string): boolean {
+		// Check all sessions that match this key (could be channel or thread)
+		for (const [key, state] of sessionStates) {
+			if (key.includes(sessionKey) && state.running) return true;
+		}
+		return false;
 	},
 
-	async handleStop(channelId: string, slack: SlackBot): Promise<void> {
-		const state = channelStates.get(channelId);
-		if (state?.running) {
-			state.stopRequested = true;
-			state.runner.abort();
-			const ts = await slack.postMessage(channelId, "_Stopping..._");
-			state.stopMessageTs = ts; // Save for updating later
-		} else {
-			await slack.postMessage(channelId, "_Nothing running_");
+	async handleStop(sessionKey: string, slack: SlackBot): Promise<void> {
+		for (const [key, state] of sessionStates) {
+			if (key.includes(sessionKey) && state.running) {
+				state.stopRequested = true;
+				state.runner.abort();
+				const ts = await slack.postMessage(state.channelId, "_Stopping..._");
+				state.stopMessageTs = ts;
+				return;
+			}
 		}
 	},
 
 	async handleEvent(event: SlackEvent, slack: SlackBot, isEvent?: boolean): Promise<void> {
-		const state = getState(event.channel);
+		const state = getOrCreateState(event);
+		const threadKey = event.thread_ts || event.ts;
 
 		// Start run
 		state.running = true;
 		state.stopRequested = false;
 
-		log.logInfo(`[${event.channel}] Starting run: ${event.text.substring(0, 50)}`);
+		log.logInfo(`[${event.channel}:${threadKey}] Starting run: ${event.text.substring(0, 50)}`);
 
 		try {
 			// Create context adapter
@@ -279,7 +301,7 @@ const handler: MomHandler = {
 				}
 			}
 		} catch (err) {
-			log.logWarning(`[${event.channel}] Run error`, err instanceof Error ? err.message : String(err));
+			log.logWarning(`[${event.channel}:${threadKey}] Run error`, err instanceof Error ? err.message : String(err));
 		} finally {
 			state.running = false;
 		}

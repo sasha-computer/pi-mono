@@ -15,6 +15,7 @@ export interface SlackEvent {
 	ts: string;
 	user: string;
 	text: string;
+	thread_ts?: string;
 	files?: Array<{ name?: string; url_private_download?: string; url_private?: string }>;
 	/** Processed attachments with local paths (populated after logUserMessage) */
 	attachments?: Attachment[];
@@ -277,6 +278,7 @@ export class SlackBot {
 				channel: string;
 				user: string;
 				ts: string;
+				thread_ts?: string;
 				files?: Array<{ name: string; url_private_download?: string; url_private?: string }>;
 			};
 
@@ -290,6 +292,7 @@ export class SlackBot {
 				type: "mention",
 				channel: e.channel,
 				ts: e.ts,
+				thread_ts: e.thread_ts,
 				user: e.user,
 				text: e.text.replace(/<@[A-Z0-9]+>/gi, "").trim(),
 				files: e.files,
@@ -329,13 +332,14 @@ export class SlackBot {
 			ack();
 		});
 
-		// All messages (for logging) + DMs (for triggering)
+		// All messages (for logging) + DMs + thread replies (for triggering)
 		this.socketClient.on("message", ({ event, ack }) => {
 			const e = event as {
 				text?: string;
 				channel: string;
 				user?: string;
 				ts: string;
+				thread_ts?: string;
 				channel_type?: string;
 				subtype?: string;
 				bot_id?: string;
@@ -358,9 +362,10 @@ export class SlackBot {
 
 			const isDM = e.channel_type === "im";
 			const isBotMention = e.text?.includes(`<@${this.botUserId}>`);
+			const isThreadReply = !!e.thread_ts && e.thread_ts !== e.ts;
 
-			// Skip channel @mentions - already handled by app_mention event
-			if (!isDM && isBotMention) {
+			// Skip channel @mentions (not in threads) - already handled by app_mention event
+			if (!isDM && isBotMention && !isThreadReply) {
 				ack();
 				return;
 			}
@@ -369,7 +374,8 @@ export class SlackBot {
 				type: isDM ? "dm" : "mention",
 				channel: e.channel,
 				ts: e.ts,
-				user: e.user,
+				thread_ts: e.thread_ts,
+				user: e.user!,
 				text: (e.text || "").replace(/<@[A-Z0-9]+>/gi, "").trim(),
 				files: e.files,
 			};
@@ -385,12 +391,14 @@ export class SlackBot {
 				return;
 			}
 
-			// Only trigger handler for DMs
-			if (isDM) {
+			// Trigger handler for DMs and thread replies (thread replies don't need @mention)
+			const shouldTrigger = isDM || isThreadReply;
+			if (shouldTrigger) {
 				// Check for stop command - execute immediately, don't queue!
 				if (slackEvent.text.toLowerCase().trim() === "stop") {
-					if (this.handler.isRunning(e.channel)) {
-						this.handler.handleStop(e.channel, this); // Don't await, don't queue
+					const runKey = e.thread_ts || e.channel;
+					if (this.handler.isRunning(runKey)) {
+						this.handler.handleStop(runKey, this);
 					} else {
 						this.postMessage(e.channel, "_Nothing running_");
 					}
@@ -398,7 +406,8 @@ export class SlackBot {
 					return;
 				}
 
-				if (this.handler.isRunning(e.channel)) {
+				const runKey = e.thread_ts || e.channel;
+				if (this.handler.isRunning(runKey)) {
 					this.postMessage(e.channel, "_Already working. Say `stop` to cancel._");
 				} else {
 					this.getQueue(e.channel).enqueue(() => this.handler.handleEvent(slackEvent, this));
